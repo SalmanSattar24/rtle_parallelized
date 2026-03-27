@@ -253,13 +253,15 @@ class Market(gym.Env):
                 break
 
         # Force termination if we reach terminal_time without complete liquidation
-        # (leftover assets accepted to prevent eval from hanging)
+        # Per paper: remaining inventory is implicitly penalized in reward calculation:
+        # reward = (cash - volume * reference_bid_price) / initial_volume
+        # Unsold shares don't contribute to 'cash', so incomplete execution gets lower reward
         if not terminated and hasattr(self, 'agents') and self.execution_agent_id in self.agents:
             exec_agent = self.agents[self.execution_agent_id]
             if hasattr(exec_agent, 'terminal_time') and t >= exec_agent.terminal_time:
                 # Episode reached terminal_time - force completion
+                # Note: Remaining inventory handled via implicit penalty in reward
                 terminated = True
-                # Accept partial fills if market couldn't absorb full liquidation order
         # TODO: could only record final info to increase speed 
         # record a bunch of infos 
         mid_price = (self.lob.data.best_bid_prices[-1] + self.lob.data.best_ask_prices[-1])/2

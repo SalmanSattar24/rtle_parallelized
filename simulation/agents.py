@@ -621,6 +621,7 @@ class ExecutionAgent():
     def update_position_from_message_list(self, message_list):
         rewards = [self.update_position(m) for m in message_list]
         assert self.volume >= 0
+        # Episode terminates when inventory is completely liquidated (volume == 0)
         terminated = self.volume == 0
         return sum(rewards), terminated
 
