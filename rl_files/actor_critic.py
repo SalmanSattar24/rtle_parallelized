@@ -533,9 +533,8 @@ if __name__ == "__main__":
                 reward_np,
                 next_done_np.astype(np.float32)
             )
-            # Sync if needed (optional, depends on GPU load)
-            if step == 0:
-                pinned_buffer.synchronize()
+            # Ensure transfers complete before using tensors
+            pinned_buffer.synchronize()
 
             rewards[step] = reward_gpu.view(-1)
             next_done = next_done_gpu
