@@ -679,9 +679,17 @@ if __name__ == "__main__":
             obs_gpu = torch.from_numpy(next_obs_np).float().to(device)
             eval_step += 1
 
+            # DEBUG: Print step info
+            if eval_step % 100 == 0:
+                print(f"  Step {eval_step}: Episodes={len(episodic_returns)}, "
+                      f"Terminated={terminated}, Truncated={truncated}, "
+                      f"Has final_info={'final_info' in infos}, "
+                      f"Remaining volume={infos.get('volume', [None])[0] if 'volume' in infos else 'N/A'}")
+
             if "final_info" in infos:
                 for i, info in enumerate(infos["final_info"]):
                     if info is not None:
+                        print(f"  Episode {len(episodic_returns)+1} completed! Reward={info['reward']:.4f}, Volume={info.get('volume', 'N/A')}")
                         episodic_returns.append(info['reward'])
                         obs, _ = envs_eval.reset()
                         obs_gpu = torch.from_numpy(obs).float().to(device)
@@ -689,12 +697,21 @@ if __name__ == "__main__":
         envs_eval.close()
         print(f'evaluation time: {time.time()-start_time:.1f}s')
         print(f'reward length: {len(episodic_returns)}/{args.n_eval_episodes}')
-        rewards = np.array(episodic_returns)
-        assert args.run_name is not None, "run_name should be set"
-        # use tags such as long_horizon, GAE, or whatever
-        file_name = f'{parent_dir}/rewards/{args.run_name}.npz'
-        print(f'save rewards to {file_name}')
-        np.savez(file_name, rewards=rewards)
+
+        # Warn if we hit the step limit before collecting all episodes
+        if len(episodic_returns) < args.n_eval_episodes:
+            print(f"WARNING: Evaluation hit max_eval_steps limit ({eval_step}/{max_eval_steps}) before collecting all episodes!")
+            print(f"Only collected {len(episodic_returns)}/{args.n_eval_episodes} episodes.")
+
+        rewards = np.array(episodic_returns) if len(episodic_returns) > 0 else np.array([])
+        if len(rewards) == 0:
+            print("ERROR: No episodes completed during evaluation!")
+        else:
+            assert args.run_name is not None, "run_name should be set"
+            # use tags such as long_horizon, GAE, or whatever
+            file_name = f'{parent_dir}/rewards/{args.run_name}.npz'
+            print(f'save rewards to {file_name}')
+            np.savez(file_name, rewards=rewards)
         # if args.tag is not None:
         #     file_name = f'{parent_dir}/rewards/{args.run_name}_{args.tag}.npz'
         # else:
