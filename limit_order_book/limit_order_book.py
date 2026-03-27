@@ -183,24 +183,32 @@ class Data():
 
 class LimitOrderBook:
     def __init__(self, list_of_agents = [], level=10, only_volumes=False):
-        # how many levels of the order book are stored. level=10 means that the first 10 levels of the order book are logged? 
+        # how many levels of the order book are stored. level=10 means that the first 10 levels of the order book are logged?
         self.level = level
         self.registered_agents = list_of_agents
-        # order ids by agent 
+        # order ids by agent
         if not only_volumes:
             self.price_map = {'bid': SortedDict(neg), 'ask': SortedDict()}
             self.order_map = {}
             self.order_map_by_agent = {agent_id: set() for agent_id in list_of_agents}
         self.update_n = 0
-        # order matters here !!!, first data, then logging 
+        # order matters here !!!, first data, then logging
         self.data = Data(level=level)
         self.price_volume_map = {'bid': SortedDict(neg), 'ask': SortedDict()}
         self.only_volumes = only_volumes
         self.log_everything = True
-        self.time = -np.inf 
-        # self.only_shape = only_shape    
-        # TODO: only shape options. where we only keep track of the shape. 
-        # initialize state of the order book at step n = 0  
+        self.time = -np.inf
+
+        # BILATERAL MM: Track buy/sell orders separately per agent for market-making
+        self.agent_bid_orders = {agent_id: set() for agent_id in list_of_agents}
+        self.agent_ask_orders = {agent_id: set() for agent_id in list_of_agents}
+        # BILATERAL MM: Net inventory tracking (sum of buys - sum of sells)
+        self.agent_net_inventory = {agent_id: 0 for agent_id in list_of_agents}
+        # BILATERAL MM: Fill history for inventory verification
+        self.agent_fill_history = {agent_id: [] for agent_id in list_of_agents}
+        # self.only_shape = only_shape
+        # TODO: only shape options. where we only keep track of the shape.
+        # initialize state of the order book at step n = 0
         # self._logging()
     
     def _logging(self, order, msg=None):
@@ -373,15 +381,18 @@ class LimitOrderBook:
 
         
         if order.price in self.price_map[order.side]:
-            # add order to price level 
-            self.price_map[order.side][order.price].add(order.order_id) 
+            # add order to price level
+            self.price_map[order.side][order.price].add(order.order_id)
         else:
-            # SortedList 
+            # SortedList
             self.price_map[order.side][order.price] = SortedList([order.order_id])
-        
+
         # add order to order map and order map by agent
         self.order_map[order.order_id] = order
         self.order_map_by_agent[order.agent_id].add(order.order_id)
+
+        # BILATERAL MM: Register this order for bilateral tracking
+        self.register_limit_order(order.agent_id, order.order_id, order.side)
 
         return LimitOrderFill(order_id=order.order_id, price=order.price, volume=order.volume, side=order.side, agent_id=order.agent_id)
 
@@ -431,8 +442,8 @@ class LimitOrderBook:
 
         # remaining_market_volume = order.volume
         # prices = list(self.price_map[side].keys())
-        for price in prices: 
-            # cp = counterparty             
+        for price in prices:
+            # cp = counterparty
             cp_order_ids = deepcopy(self.price_map[side][price])
             for cp_order_id in cp_order_ids:
                 cp_order = self.order_map[cp_order_id]
@@ -441,9 +452,13 @@ class LimitOrderBook:
                     raise ValueError("market volume is negative")
                 elif market_volume < cp_order.volume:
                     # counterparty order is partially filled
-                    # the partial fill tag might not be necessary. mainly just for additional info. 
                     msg = PassiveFill(order=cp_order, filled_volume=market_volume, partial_fill=True)
                     passive_fills.add(cp_agent_id, msg)
+                    # BILATERAL MM: Update counterparty agent's inventory (passive fill)
+                    # Passive fill direction is OPPOSITE of market order direction
+                    # If market hits 'bid', passive agent's bid gets filled = they BOUGHT
+                    opposite_side = 'ask' if order.side == 'bid' else 'bid'
+                    self.update_agent_orders_and_inventory(cp_agent_id, cp_order_id, opposite_side, market_volume)
                     cp_order.volume -= market_volume
                     execution_price += price * market_volume
                     filled_volume += market_volume
@@ -451,12 +466,15 @@ class LimitOrderBook:
                     break
                 elif market_volume >= cp_order.volume:
                     # counterparty order is fully filled
-                    # fill_msg = PassiveFill(ord, filled_volume=cp_order.volume, fill_price=price, side=side, partial_fill=False, agent_id=cp_agent_id)
                     msg = PassiveFill(order=cp_order, filled_volume=cp_order.volume, partial_fill=False)
                     passive_fills.add(cp_agent_id, msg)
-                    self.price_map[side][price].remove(cp_order_id)              
+                    # BILATERAL MM: Update counterparty agent's inventory (passive fill)
+                    # Passive fill direction is OPPOSITE of market order direction
+                    opposite_side = 'ask' if order.side == 'bid' else 'bid'
+                    self.update_agent_orders_and_inventory(cp_agent_id, cp_order_id, opposite_side, cp_order.volume)
+                    self.price_map[side][price].remove(cp_order_id)
                     self.order_map.pop(cp_order_id)
-                    self.order_map_by_agent[cp_order.agent_id].remove(cp_order.order_id)   # remove is for sets 
+                    self.order_map_by_agent[cp_order.agent_id].remove(cp_order.order_id)   # remove is for sets
                     filled_volume += cp_order.volume
                     execution_price += price * cp_order.volume
                     market_volume = market_volume - cp_order.volume
@@ -468,19 +486,24 @@ class LimitOrderBook:
             if not self.price_map[side][price]:
                 self.price_map[side].pop(price)
                 assert price not in self.price_volume_map[side], "price still in price volume map"
-            if market_volume == 0.0:                
+            if market_volume == 0.0:
                 break
-        
-        # basic checks 
+
+        # basic checks
         # warnings.warn(f"{order}, market volume not fully executed")
-        if market_volume > 0.0: 
+        if market_volume > 0.0:
             warnings.warn(f"{order}, market volume not fully executed")
             # print(f'order time: {order.time}')
             # print(f'bid volumes: {self.level2("bid")[1][:10]}')
             # print(f'ask volumes: {self.level2("ask")[1][:10]}')
         if market_volume < 0:
             raise ValueError("filled volume cannot be negative")
-        
+
+        # BILATERAL MM: Update market order agent's inventory
+        # side='bid' means hitting bid side = agent SELLING = negative inventory
+        # side='ask' means hitting ask side = agent BUYING = positive inventory
+        self.update_agent_orders_and_inventory(order.agent_id, -1, order.side, filled_volume)
+
         # create fill message for the market order
         msg = MarketOrderFill(order = order, execution_price=execution_price, filled_volume=filled_volume, partial_fill=market_volume>0, passive_fills=passive_fills.messages)
 
@@ -711,14 +734,82 @@ class LimitOrderBook:
         orders['price'] = order_price        
         orders['time'] = order_time
         orders = pd.DataFrame(orders)
-        # 
+        #
         market_orders = {}
         market_orders['buy'] = self.data.market_buy
         market_orders['sell'] = self.data.market_sell
         market_orders['time'] = self.data.time_stamps
         market_orders = pd.DataFrame(market_orders)
         return data, orders, market_orders
-        
+
+
+    # BILATERAL MM: Inventory tracking methods
+    def update_agent_orders_and_inventory(self, agent_id, order_id, side, filled_volume):
+        """
+        Update bid/ask order tracking and net inventory when a fill occurs.
+        Called whenever an order is filled (market or passive).
+
+        Args:
+            agent_id: ID of the agent
+            order_id: ID of the order being filled
+            side: 'bid' or 'ask' - indicates which side of the book was hit
+            filled_volume: Volume that was filled
+
+        Note on convention:
+            - side='bid' means market order hit the BID side (agent is SELLING)
+            - side='ask' means market order hit the ASK side (agent is BUYING)
+            So inventory change direction is OPPOSITE to side name
+        """
+        if agent_id not in self.agent_bid_orders:
+            return  # Agent not registered for bilateral tracking
+
+        # Track active orders
+        if side == 'bid':
+            if order_id in self.agent_ask_orders[agent_id]:
+                self.agent_ask_orders[agent_id].discard(order_id)
+            # Market hit to bid side = agent is SELLING (negative inventory)
+            self.agent_net_inventory[agent_id] -= filled_volume
+            self.agent_fill_history[agent_id].append(('sell', filled_volume, side))
+        else:  # 'ask'
+            if order_id in self.agent_bid_orders[agent_id]:
+                self.agent_bid_orders[agent_id].discard(order_id)
+            # Market hit to ask side = agent is BUYING (positive inventory)
+            self.agent_net_inventory[agent_id] += filled_volume
+            self.agent_fill_history[agent_id].append(('buy', filled_volume, side))
+
+    def register_limit_order(self, agent_id, order_id, side):
+        """
+        Register a limit order as active for an agent.
+        """
+        if agent_id not in self.agent_bid_orders:
+            return  # Agent not registered for bilateral tracking
+
+        if side == 'bid':
+            self.agent_bid_orders[agent_id].add(order_id)
+        else:  # 'ask'
+            self.agent_ask_orders[agent_id].add(order_id)
+
+    def assert_inventory_consistent(self):
+        """
+        Verify that net inventory is consistent with fill history.
+        Should be called periodically (e.g., end of episode) for validation.
+
+        Raises:
+            AssertionError: If inventory is inconsistent
+        """
+        for agent_id in self.agent_fill_history:
+            computed_inventory = 0
+            for action, volume, _ in self.agent_fill_history[agent_id]:
+                if action == 'buy':
+                    computed_inventory += volume
+                else:  # 'sell'
+                    computed_inventory -= volume
+
+            tracked_inventory = self.agent_net_inventory[agent_id]
+            assert computed_inventory == tracked_inventory, (
+                f"Inventory mismatch for agent {agent_id}: "
+                f"computed={computed_inventory}, tracked={tracked_inventory}"
+            )
 
 
 if __name__ == "__main__":

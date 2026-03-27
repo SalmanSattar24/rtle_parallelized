@@ -34,6 +34,8 @@ class Args:
     """seed of the experiment"""
     eval_seed: int = 100
     """seed for evaluation"""
+    bilateral: bool = False
+    """if toggled, use bilateral market-making agent (BilateralAgentLogisticNormal)"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False"""
     cuda: bool = True
@@ -345,9 +347,186 @@ class DirichletAgent(nn.Module):
     
     def deterministic_action(self, state):
         # get concentration parameters from the network
-        mean = torch.nn.functional.softplus(self.actor_mean(state))  
+        mean = torch.nn.functional.softplus(self.actor_mean(state))
         return mean / torch.sum(mean, dim=1, keepdim=True)
-    
+
+
+class BilateralAgentLogisticNormal(nn.Module):
+    """
+    BILATERAL MARKET-MAKING AGENT (Phase 2.3)
+
+    Dual-head policy network for simultaneous bid/ask order placement.
+    - Shared trunk (critic) for state encoding
+    - Two independent policy heads: actor_mean_bid and actor_mean_ask
+    - Factored simplex policy: π(bid, ask | s) = π_bid(bid | s) * π_ask(ask | s)
+    - Each action independently normalized to simplex
+
+    Architecture:
+        Input (observation) → Shared Trunk (128-128) → [Bid Head] → bid_action (K+1)
+                                                    → [Ask Head] → ask_action (K+1)
+
+    Action sampling:
+        1. Sample bid_base ~ N(μ_bid, σ_I) independently
+        2. Sample ask_base ~ N(μ_ask, σ_I) independently
+        3. Apply logistic transform to each: a = softmax([exp(x), 1])
+        4. Return (bid_action, ask_action) as tuple
+
+    Loss factorization:
+        log π = log π_bid + log π_ask
+        entropy = entropy_bid + entropy_ask
+    """
+
+    def __init__(self, envs, variance_scaling=True):
+        n_hidden_units = 128
+        super().__init__()
+
+        obs_shape = np.array(envs.single_observation_space.shape).prod()
+        action_dim = np.prod(envs.single_action_space.shape) - 1  # -1 because last component is computed from others
+
+        # SHARED TRUNK: Common feature extraction
+        self.trunk = nn.Sequential(
+            layer_init(nn.Linear(obs_shape, n_hidden_units)),
+            nn.Tanh(),
+            layer_init(nn.Linear(n_hidden_units, n_hidden_units)),
+            nn.Tanh(),
+        )
+
+        # CRITIC HEAD: Value function (unchanged from unilateral)
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, 1), std=1.0),
+        )
+
+        # BID POLICY HEAD: μ_bid for bid-side orders
+        self.actor_mean_bid = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, action_dim), std=1e-5),
+        )
+        # Custom bias: [-1, -1, ..., -1, 1] → initial action skews toward inactive orders
+        x_bid = -1.0 * torch.ones(action_dim)
+        x_bid[-1] = 1.0
+        self.actor_mean_bid[-1].bias.data.copy_(x_bid)
+
+        # ASK POLICY HEAD: μ_ask for ask-side orders
+        self.actor_mean_ask = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, action_dim), std=1e-5),
+        )
+        # Custom bias: same initialization
+        x_ask = -1.0 * torch.ones(action_dim)
+        x_ask[-1] = 1.0
+        self.actor_mean_ask[-1].bias.data.copy_(x_ask)
+
+        # VARIANCE: Shared across both heads
+        self.variance_scaling = variance_scaling
+        if variance_scaling:
+            self.variance = 1.0
+        else:
+            self.log_std = nn.Parameter(torch.zeros(action_dim), requires_grad=True)
+
+    def get_value(self, x):
+        trunk_out = self.trunk(x)
+        return self.critic(trunk_out)
+
+    def get_action_and_value(self, x, action=None, deterministic=False):
+        """
+        Sample bilateral actions with factored policy.
+
+        Args:
+            x: observation tensor (batch_size, obs_dim)
+            action: Tuple of (bid_action, ask_action) for computing log probs [optional]
+            deterministic: If True, use means without sampling
+
+        Returns:
+            actions: Tuple (bid_action, ask_action), each shape (batch_size, K+1)
+            log_prob: Sum of bid and ask log probs, shape (batch_size,)
+            entropy: Sum of bid and ask entropies, shape (batch_size,)
+            value: State value, shape (batch_size, 1)
+        """
+        trunk_out = self.trunk(x)
+
+        # Get policy means for both bid and ask
+        bid_mean = self.actor_mean_bid(trunk_out)
+        ask_mean = self.actor_mean_ask(trunk_out)
+
+        # Construct standard deviations
+        if self.variance_scaling:
+            bid_std = torch.ones_like(bid_mean) * self.variance
+            ask_std = torch.ones_like(ask_mean) * self.variance
+        else:
+            bid_std = torch.exp(self.log_std).expand_as(bid_mean)
+            ask_std = torch.exp(self.log_std).expand_as(ask_mean)
+
+        # Create distributions for bid and ask (independent)
+        bid_dist = Normal(bid_mean, bid_std)
+        ask_dist = Normal(ask_mean, ask_std)
+
+        # Sample or extract base actions
+        with torch.no_grad():
+            if action is None:
+                # Sample phase: generate new actions
+                bid_base = bid_dist.sample()
+                ask_base = ask_dist.sample()
+
+                # Apply logistic transform to each independently
+                # bid_action: from K-dim base_action to K+1-dim simplex
+                z_bid = 1 + torch.sum(torch.exp(bid_base), dim=1, keepdim=True)
+                bid_action = torch.exp(bid_base) / z_bid
+                bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
+
+                # ask_action: from K-dim base_action to K+1-dim simplex
+                z_ask = 1 + torch.sum(torch.exp(ask_base), dim=1, keepdim=True)
+                ask_action = torch.exp(ask_base) / z_ask
+                ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
+
+            else:
+                # Inference phase: invert simplex actions to get base actions
+                bid_action, ask_action = action
+
+                # Inverse logistic transform for bid
+                bid_last = bid_action[:, -1].reshape(-1, 1)
+                bid_base = torch.log(bid_action[:, :-1] / bid_last)
+
+                # Inverse logistic transform for ask
+                ask_last = ask_action[:, -1].reshape(-1, 1)
+                ask_base = torch.log(ask_action[:, :-1] / ask_last)
+
+        # Compute log probabilities (factored)
+        bid_log_prob = bid_dist.log_prob(bid_base).sum(1)
+        ask_log_prob = ask_dist.log_prob(ask_base).sum(1)
+        log_prob_joint = bid_log_prob + ask_log_prob  # Factorization: π = π_bid * π_ask
+
+        # Compute entropies (factored)
+        bid_entropy = bid_dist.entropy().sum(1)
+        ask_entropy = ask_dist.entropy().sum(1)
+        entropy_joint = bid_entropy + ask_entropy
+
+        # Pack actions as tuple for bilateral mode
+        actions = (bid_action, ask_action)
+
+        return actions, log_prob_joint, entropy_joint, self.critic(trunk_out)
+
+    def deterministic_action(self, x):
+        """
+        Deterministic action selection using means (no noise).
+
+        Returns:
+            Tuple of (bid_action, ask_action) using mean policy
+        """
+        trunk_out = self.trunk(x)
+        bid_mean = self.actor_mean_bid(trunk_out)
+        ask_mean = self.actor_mean_ask(trunk_out)
+
+        with torch.no_grad():
+            # Logistic transform on bid
+            z_bid = 1 + torch.sum(torch.exp(bid_mean), dim=1, keepdim=True)
+            bid_action = torch.exp(bid_mean) / z_bid
+            bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
+
+            # Logistic transform on ask
+            z_ask = 1 + torch.sum(torch.exp(ask_mean), dim=1, keepdim=True)
+            ask_action = torch.exp(ask_mean) / z_ask
+            ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
+
+        return (bid_action, ask_action)
+
 
 if __name__ == "__main__":
     """
@@ -455,8 +634,15 @@ if __name__ == "__main__":
         enable_async=True
     )
 
-    # agent set up. we have three cases log_normal, dirichlet, and normal 
-    if args.exp_name == 'log_normal':
+    # agent set up. we have three cases log_normal, dirichlet, and normal
+    # Also add bilateral variant for market-making
+    print(f'Bilateral mode: {args.bilateral}')
+
+    if args.bilateral:
+        print('Using BilateralAgentLogisticNormal for bilateral market-making')
+        agent = BilateralAgentLogisticNormal(envs).to(device)
+        args.exp_name = 'bilateral_log_normal'
+    elif args.exp_name == 'log_normal':
         agent = AgentLogisticNormal(envs).to(device)
     elif args.exp_name == 'log_normal_learn_std':
         agent = AgentLogisticNormal(envs, variance_scaling=False).to(device)
@@ -472,7 +658,15 @@ if __name__ == "__main__":
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+
+    # Handle bilateral vs unilateral action storage
+    if args.bilateral:
+        # For bilateral: store bid and ask actions separately
+        bid_actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+        ask_actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+    else:
+        actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -500,7 +694,7 @@ if __name__ == "__main__":
             optimizer.param_groups[0]["lr"] = lrnow
             print(f' the lerning rate is {lrnow}')        
         # manual standard deviation scalig. updated this to 0.1
-        if args.exp_name == 'log_normal' or args.exp_name == 'normal':
+        if args.exp_name == 'log_normal' or args.exp_name == 'normal' or args.exp_name == 'bilateral_log_normal':
             agent.variance = (0.32-1)*(iteration)/(args.num_iterations-1) + 1        
         # dirichlet agent does not use variance scaling 
         # agent.variance = 1 - iteration/(args.num_iterations+1) + 5e-1
@@ -519,12 +713,23 @@ if __name__ == "__main__":
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs_gpu)
                 values[step] = value.flatten()
-            actions[step] = action
+
+            if args.bilateral:
+                # action is tuple (bid_action, ask_action)
+                bid_action, ask_action = action
+                bid_actions[step] = bid_action
+                ask_actions[step] = ask_action
+                # Pass tuple to environment
+                env_action = (bid_action.cpu().numpy(), ask_action.cpu().numpy())
+            else:
+                actions[step] = action
+                env_action = action.cpu().numpy()
+
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
             # PHASE 1 OPTIMIZATION: Use pinned memory for efficient transfers
-            next_obs_np, reward_np, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            next_obs_np, reward_np, terminations, truncations, infos = envs.step(env_action)
             next_done_np = np.logical_or(terminations, truncations)
 
             # Non-blocking async transfer with pinned memory
@@ -570,7 +775,16 @@ if __name__ == "__main__":
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+
+        if args.bilateral:
+            # For bilateral: reshape bid and ask actions separately
+            b_bid_actions = bid_actions.reshape((-1,) + envs.single_action_space.shape)
+            b_ask_actions = ask_actions.reshape((-1,) + envs.single_action_space.shape)
+            # Combine into list of tuples for passing to agent
+            b_actions = [(b_bid_actions[i], b_ask_actions[i]) for i in range(len(b_bid_actions))]
+        else:
+            b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -585,8 +799,16 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                # log probs are computed with old actions 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                # log probs are computed with old actions
+                if args.bilateral:
+                    # Extract bid and ask actions for this minibatch
+                    mb_bid_actions = torch.stack([b_bid_actions[i] for i in mb_inds])
+                    mb_ask_actions = torch.stack([b_ask_actions[i] for i in mb_inds])
+                    mb_actions = (mb_bid_actions, mb_ask_actions)
+                else:
+                    mb_actions = b_actions[mb_inds]
+
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], mb_actions)
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -627,14 +849,15 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/total_loss", loss, global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        if args.exp_name == 'log_normal' or args.exp_name == 'normal':
+
+        # Log variance only for agents that have variance scaling
+        if hasattr(agent, 'variance') and (args.exp_name == 'log_normal' or args.exp_name == 'normal' or args.exp_name == 'bilateral_log_normal'):
             writer.add_scalar("values/variance", agent.variance, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
@@ -672,8 +895,16 @@ if __name__ == "__main__":
         while len(episodic_returns) < args.n_eval_episodes and eval_step < max_eval_steps:
             with torch.no_grad():
                 # always use deterministic action for evaluation
-                actions = agent.deterministic_action(obs_gpu)  # Input: (1, obs_dim), Output: (1, action_dim)
-                next_obs_np, _, terminated, truncated, info = env_eval.step(actions.squeeze(0).cpu().numpy())  # Remove batch dim
+                actions = agent.deterministic_action(obs_gpu)  # Input: (1, obs_dim), Output: (1, action_dim) or tuple
+
+                if args.bilateral:
+                    # actions is tuple (bid_action, ask_action)
+                    bid_action, ask_action = actions
+                    env_actions = (bid_action.squeeze(0).cpu().numpy(), ask_action.squeeze(0).cpu().numpy())
+                else:
+                    env_actions = actions.squeeze(0).cpu().numpy()
+
+                next_obs_np, _, terminated, truncated, info = env_eval.step(env_actions)
 
             obs_gpu = torch.from_numpy(next_obs_np).float().to(device).unsqueeze(0)  # Add batch dim back
             eval_step += 1

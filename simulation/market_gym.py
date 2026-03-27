@@ -31,30 +31,36 @@ class Market(gym.Env):
     def __init__(self, config):
 
         """
-        initialize the class with a config with keys 
+        initialize the class with a config with keys
             market_env (str): noise, flow, strategic
             execution_agent (str): sl_agent, linear_sl_agent, rl_agent
             volume (int): number of lots to trade
             seed (int): seed for the random number generator
             terminal_time (int): time at which the simulation should terminate
-            time_delta (int): time difference at which the agent trades                                   
+            time_delta (int): time difference at which the agent trades
+            inventory_max (int): maximum allowed absolute inventory (for MM penalty) - optional
         """
 
         assert 'market_env' in config
         assert 'execution_agent' in config
         assert 'volume' in config
         assert 'seed' in config
-        assert 'terminal_time' in config 
-        assert 'time_delta' in config         
+        assert 'terminal_time' in config
+        assert 'time_delta' in config
         assert 'drop_feature' in config
         assert config['drop_feature'] in [None, 'volume', 'order_info', 'drift']
 
         seed = config['seed']
-        
+
         assert config['market_env'] in ['noise', 'flow', 'strategic']
         assert config['execution_agent'] in ['market_agent', 'sl_agent', 'linear_sl_agent', 'rl_agent']
 
         self.agents = {}
+
+        # BILATERAL MM: Inventory management
+        self.inventory_max = config.get('inventory_max', float('inf'))  # No limit by default
+        self.penalty_weight = config.get('penalty_weight', 1.0)  # Penalty multiplier for exceeding limits
+        self.agent_inventory = 0  # Net inventory starts at 0 (pure market-making)
         
         # set up initial agent          
         if config['market_env'] == 'noise':
@@ -146,6 +152,8 @@ class Market(gym.Env):
             rl_agent_config['time_delta'] = config['time_delta']
             rl_agent_config['volume'] = config['volume']
             rl_agent_config['drop_feature'] = config['drop_feature']
+            # BILATERAL MM: Pass inventory_max to RLAgent
+            rl_agent_config['inventory_max'] = self.inventory_max
             if config['market_env'] == 'noise':
                 rl_agent_config['initial_shape_file'] = f'{parent_dir}/initial_shape/noise_65.npz'
             else:
@@ -181,21 +189,23 @@ class Market(gym.Env):
 
     def reset(self, seed=None, options=None):
         self.lob = LimitOrderBook(list_of_agents=list(self.agents.keys()), level=30, only_volumes=False)
-        # reset agents 
+        # reset agents
         for agent_id in self.agents:
             self.agents[agent_id].reset()
-        # initialize event queue 
+        # BILATERAL MM: Reset inventory to 0 (pure market-making mode)
+        self.agent_inventory = 0
+        # initialize event queue
         self.pq = PriorityQueue()
-        # set initial events 
+        # set initial events
         for agent_id in self.agents:
             # noise agent just puts the first event at its initial time (the first event should also be drawn from an exponential distribution)
-            # although this is not completely correct 
+            # although this is not completely correct
             out = self.agents[agent_id].initial_event()
             self.pq.put(out)
-        # runs up to first observation or stops if the simulation is terminated 
+        # runs up to first observation or stops if the simulation is terminated
         # if there is no RL agent present and no observation agent present, transition will just run straight to the end without any intermediate action
         observation, reward, terminated, info = self.transition()
-        # this will terminate if the execution agent is one of the benchmark agents 
+        # this will terminate if the execution agent is one of the benchmark agents
         return observation, info
     
     def step(self, action=None):
@@ -234,13 +244,22 @@ class Market(gym.Env):
             # looks like an error. orders == [] should not evaluate to True 
             if orders is not None or orders == []:
                 msgs = self.lob.process_order_list(orders)
-                # update execution agent position 
+                # update execution agent position
                 # noise agent and strategic agent do not update their positions
                 # breack happens when execution agent is filled
                 # only execution agent has attribute updat_postion_from_message_list
                 # only update the execution agent. this could be RL or benchmark agent
                 reward, terminated = self.agents[self.execution_agent_id].update_position_from_message_list(msgs)
                 transition_reward += reward
+
+                # BILATERAL MM: Update net inventory from LOB and apply soft penalty if needed
+                self.agent_inventory = self.lob.agent_net_inventory.get(self.execution_agent_id, 0)
+                if abs(self.agent_inventory) >= self.inventory_max:
+                    # Apply soft penalty for exceeding inventory limits
+                    excess_inventory = abs(self.agent_inventory) - self.inventory_max
+                    penalty = self.penalty_weight * excess_inventory
+                    transition_reward -= penalty
+
                 if terminated:
                     break
             # if not terminated or execution agent not present, generate a new event 
@@ -262,17 +281,19 @@ class Market(gym.Env):
                 # Episode reached terminal_time - force completion
                 # Note: Remaining inventory handled via implicit penalty in reward
                 terminated = True
-        # TODO: could only record final info to increase speed 
-        # record a bunch of infos 
+        # TODO: could only record final info to increase speed
+        # record a bunch of infos
         mid_price = (self.lob.data.best_bid_prices[-1] + self.lob.data.best_ask_prices[-1])/2
         initial_mid_price = (self.agents['initial_agent'].initial_ask + self.agents['initial_agent'].initial_bid)/2
-        info = {'reward': self.agents[self.execution_agent_id].cummulative_reward, 
-                'passive_fill_rate': self.agents[self.execution_agent_id].limit_sells/self.agents[self.execution_agent_id].initial_volume,                
+        info = {'reward': self.agents[self.execution_agent_id].cummulative_reward,
+                'passive_fill_rate': self.agents[self.execution_agent_id].limit_sells/self.agents[self.execution_agent_id].initial_volume,
                 'time': t,
                 'drift': mid_price - initial_mid_price,
                 'n_events': self.agents['noise_agent'].n_events,
-                'terminated': terminated, 
-                'volume': self.agents[self.execution_agent_id].volume
+                'terminated': terminated,
+                'volume': self.agents[self.execution_agent_id].volume,
+                'net_inventory': self.agent_inventory,  # BILATERAL MM: Add inventory tracking
+                'inventory_limit': self.inventory_max,  # BILATERAL MM: Add limit info
                 }
         if self.execution_agent_id == 'rl_agent':
             # if rl agent is present, get an observation from the market 

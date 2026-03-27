@@ -894,7 +894,7 @@ class RLAgent(ExecutionAgent):
         methods:
             - ... 
     """
-    def __init__(self, action_book_levels, observation_book_levels, volume, terminal_time, start_time, time_delta, priority, initial_shape_file=None, drop_feature=None) -> None:
+    def __init__(self, action_book_levels, observation_book_levels, volume, terminal_time, start_time, time_delta, priority, initial_shape_file=None, drop_feature=None, inventory_max=None) -> None:
         """
         args:
             - action_book_levels: for example if this is = 2, post on the first two levels of the order book, action space is then [m,l1,l2,inactive]
@@ -902,13 +902,14 @@ class RLAgent(ExecutionAgent):
             - volume: volume to be traded
             - terminal_time: terminal time of the agent
             - start_time: start time of the agent
-            - time_delta: time delta between actions 
+            - time_delta: time delta between actions
             - priority: priority of the agent
+            - inventory_max: maximum allowed absolute inventory (for MM) - optional
         """
         if drop_feature is not None:
-            assert drop_feature in ['volume',  'order_info', 'drift']          
-        else: 
-            pass 
+            assert drop_feature in ['volume',  'order_info', 'drift']
+        else:
+            pass
         self.drop_feature = drop_feature
 
         assert action_book_levels >= 1, 'action book levels must be at least 1'
@@ -917,24 +918,32 @@ class RLAgent(ExecutionAgent):
         self.start_time = start_time
         self.terminal_time = terminal_time
         self.time_delta = time_delta
-        # observation space length depends on features and queue positions, see the code below 
-        # note: adding queue positions did not improve the result in the flow 40 case 
-        # currently no better idea than setting this manually 
+
+        # BILATERAL MM: Inventory management
+        self.inventory_max = inventory_max if inventory_max is not None else float('inf')
+        self.last_net_inventory = 0  # Track previous inventory for time-weighted computation
+        self.cumulative_abs_inventory_time = 0.0  # Track sum(|I(s)| * dt) for time-weighted feature
+        self.last_time = start_time  # Track previous time
+
+        # observation space length depends on features and queue positions, see the code below
+        # note: adding queue positions did not improve the result in the flow 40 case
+        # currently no better idea than setting this manually
         # self.observation_space_length = 176
-        # self.observation_space_length = 146 # shape with new queue position encoding 
-        # 6: time, volume, bid_price_drift, mid_price_drift, spread, imbalance 
-        # 3: mo_imbalance lo_imbalac, price_dift_delta // where does 4 come from ? 
-        # 7: order_distribution: 5 observation levels, and one overflow level, one level for no orders placed.  
-        # bid and ask volumes: 5 + 5 
+        # self.observation_space_length = 146 # shape with new queue position encoding
+        # 6: time, volume, bid_price_drift, mid_price_drift, spread, imbalance
+        # 3: mo_imbalance lo_imbalac, price_dift_delta // where does 4 come from ?
+        # 7: order_distribution: 5 observation levels, and one overflow level, one level for no orders placed.
+        # bid and ask volumes: 5 + 5
         # levels and queue positions: 2*60
-        # added cancellation imbalance features 
-        self.observation_space_length = 6+4+6+5+5+2*int(volume)+1
+        # added cancellation imbalance features
+        # BILATERAL MM: +2 for normalized inventory and time-weighted inventory
+        self.observation_space_length = 6+4+6+5+5+2*int(volume)+1 + 2
         # adjusting observation space length if we drop features
         if self.drop_feature == 'volume':
-            # 5 order book levels on each side + imbalance feature 
-            self.observation_space_length = self.observation_space_length - 10 - 1  
+            # 5 order book levels on each side + imbalance feature
+            self.observation_space_length = self.observation_space_length - 10 - 1
         elif self.drop_feature == 'order_info':
-            # drop: level and queue position information 
+            # drop: level and queue position information
             # drop: order distribution information: 5 levels + overflow + no order placed
             self.observation_space_length = self.observation_space_length - 2*int(volume) - observation_book_levels - 2
         elif self.drop_feature == 'drift':
@@ -943,11 +952,11 @@ class RLAgent(ExecutionAgent):
             self.observation_space_length -= 3
             # new: also drop mid_price_drift and bid_price_drift
             self.observation_space_length -= 2
-            # cancellation imbalance 
+            # cancellation imbalance
             self.observation_space_length -= 1
-        # final shape is 6+4+6+5+5+60+60 with observable levels = 5 
+        # final shape is 6+4+6+5+5+60+60 with observable levels = 5
         # market, l1, l2, inactive
-        self.action_space_length = action_book_levels + 2 
+        self.action_space_length = action_book_levels + 2
         self.action_book_levels = action_book_levels
         self.observation_book_levels = observation_book_levels
         self.start_at_best_price = True
@@ -955,53 +964,68 @@ class RLAgent(ExecutionAgent):
         if initial_shape_file is not None:
             self.initial_shape = (np.load(initial_shape_file)['bidv']+np.load(initial_shape_file)['askv'])/2
         else:
-            # some normalization constant 
+            # some normalization constant
             self.initial_shape = 20
-            
         
     def generate_order(self, lob, time, action):
-        """ 
-            input: 
-                - action: 
-                    - action is np.array 
-                    - for example if action is np.array of length 6:  a[0] = market order, a[1] = limit first level, a[2] = limit second level, a[3] = limit third level, a[4] = limit forth level, a[5] = inactive orders
-                    - if action is not in the simplex, we normalize it, such that its part of the simplex (at the moment we always normalize)                 
-                - lob: current statte of the order book 
-                - time: current time 
+        """
+            input:
+                - action:
+                    - CURRENT (one-sided): action is np.array of shape (K+2,)
+                      [market%, l1%, l2%, ..., lK%, inactive%]
+                    - BILATERAL (Phase 2+): action is tuple (bid_action, ask_action)
+                      where both are K+2 dimensional simplex vectors
+                    - action is normalized to be part of the simplex
+                - lob: current state of the order book
+                - time: current time
 
-            returns: 
+            returns:
                 - order_list: list of orders to be placed
 
         """
         assert self.start_time <= time <= self.terminal_time
         assert (time-self.start_time) % self.time_delta == 0, 'time must be divisible by time delta'
-        assert len(action) == self.action_space_length, 'action length must be equal to action space length'
 
-        if time >= self.start_time and time < self.terminal_time:            
-            # normalize action such that its part of the simplex 
+        # BILATERAL MM: Handle both single action (one-sided) and dual actions (bilateral)
+        if isinstance(action, tuple) and len(action) == 2:
+            # Phase 2+: Bilateral mode (bid_action, ask_action)
+            bid_action, ask_action = action
+            return self._generate_bilateral_orders(lob, time, bid_action, ask_action)
+        else:
+            # Current: One-sided mode (backward compatible)
+            assert len(action) == self.action_space_length, 'action length must be equal to action space length'
+            return self._generate_unilateral_orders(lob, time, action)
+
+    def _generate_unilateral_orders(self, lob, time, action):
+        """
+        Generate one-sided (sell-only) orders. Current implementation.
+        Called from generate_order when action is a single vector.
+        """
+        if time >= self.start_time and time < self.terminal_time:
+            # normalize action such that its part of the simplex
             # action = np.exp(action)/np.sum(np.exp(action), axis=0)
             assert np.all(action >= 0), 'all action values must be >= 0'
             assert np.abs(np.sum(action)-1) < 1e-6, 'action must sum to 1'
             best_bid = lob.get_best_price('bid')
-            
-            # target volumes: 
-            # translate percentages to absolute value  
+
+            # target volumes:
+            # translate percentages to absolute value
             # [market%, l1% ,l2%, ,l3%, l4%, inactive%] to [market, l1, l2, l3, l4, inactive]
             target_volumes = []
-            available_volume = self.volume 
+            available_volume = self.volume
             for l in range(self.action_space_length):
-                # np.round rounds values in [0, 0.5] to 0, and values in [0.5, 1] to 1 
+                # np.round rounds values in [0, 0.5] to 0, and values in [0.5, 1] to 1
                 volume_on_level = min(np.round(action[l]*self.volume).astype(int), available_volume)
                 assert volume_on_level >= 0
                 available_volume -= volume_on_level
-                target_volumes.append(volume_on_level)                
-            # add any leftovers to the inactive level 
+                target_volumes.append(volume_on_level)
+            # add any leftovers to the inactive level
             target_volumes[-1] += available_volume
             assert sum(target_volumes) == self.volume
 
-            # get agent order allocation 
+            # get agent order allocation
             # if self.action_book_levels == 2, then volume_per_level = [l1, l2, l>2]
-            volume_per_level, orders_within_range = self.get_order_allocation(lob, self.action_book_levels)            
+            volume_per_level, orders_within_range = self.get_order_allocation(lob, self.action_book_levels)
             if self.action_book_levels >= 1:
                 assert len(volume_per_level) + 1 == len(action)
             
@@ -1052,8 +1076,33 @@ class RLAgent(ExecutionAgent):
         elif time == self.terminal_time:
             return self.sell_remaining_position(lob, time)
         else:
-            return None 
-    
+            return None
+
+    # BILATERAL MM: Phase 2+ - Bilateral order generation (to be implemented)
+    def _generate_bilateral_orders(self, lob, time, bid_action, ask_action):
+        """
+        Generate bilateral (buy and sell) orders simultaneously.
+        Phase 2.2+: To be implemented when policy network supports dual actions.
+
+        Args:
+            lob: Limit order book state
+            time: Current time
+            bid_action: Simplex-normalized bid side action (purchase allocation)
+            ask_action: Simplex-normalized ask side action (sale allocation)
+
+        Returns:
+            order_list: List of orders (bid and ask side)
+
+        TODO (Phase 2.3):
+            - Implement bid-side order generation (market buys + limit buys at bid_side levels)
+            - Implement ask-side order generation (market sells + limit sells at ask_side levels)
+            - Combine into unified order list respecting inventory quotas
+            - Use hard constraints to prevent breaching inventory limits
+        """
+        # Placeholder: For now, just use unilateral logic as fallback
+        # This ensures backward compatibility during Phase 2 development
+        return self._generate_unilateral_orders(lob, time, ask_action)
+
     def get_observation(self, time, lob):        
         """
             - sets reference prices if time == self.start_time
@@ -1196,12 +1245,33 @@ class RLAgent(ExecutionAgent):
             cancellation_imbalance =  (np.sum(sell_order_cancellations) - np.sum(buy_order_cancellations))/(np.sum(sell_order_cancellations) + np.sum(buy_order_cancellations))
         cancellation_imbalance = np.array([cancellation_imbalance], dtype=np.float32)
 
-        # mid price drift from t-delta t to t 
+        # mid price drift from t-delta t to t
         assert time >= lob.data.time_stamps[-1]
         idx_old = bisect.bisect_left(lob.data.time_stamps, time-self.time_delta)
-        mid_price_old = (lob.data.best_bid_prices[idx_old] + lob.data.best_ask_prices[idx_old])/2 
+        mid_price_old = (lob.data.best_bid_prices[idx_old] + lob.data.best_ask_prices[idx_old])/2
         mid_price_now = (lob.data.best_bid_prices[-1] + lob.data.best_ask_prices[-1])/2
         deltat_drift = np.array([(mid_price_now - mid_price_old)/10], dtype=np.float32)
+
+        # BILATERAL MM: Inventory features
+        # Get net inventory from LOB tracking
+        current_net_inventory = lob.agent_net_inventory.get(self.agent_id, 0)
+        # Update time-weighted inventory: sum(|I(s)| * dt)
+        dt = max(time - self.last_time, 0)
+        self.cumulative_abs_inventory_time += abs(current_net_inventory) * dt
+        self.last_time = time
+
+        # Normalized inventory: I(t) / I_max (range -1 to 1 or -inf to inf)
+        if self.inventory_max == float('inf'):
+            norm_inventory = np.clip(current_net_inventory / max(self.initial_volume, 1), -1.0, 1.0)
+        else:
+            norm_inventory = np.clip(current_net_inventory / max(self.inventory_max, 1), -1.0, 1.0)
+
+        # Time-weighted inventory: W(t) = cumulative_abs_inventory / (I_max * elapsed_time + epsilon)
+        elapsed_time = max(time - self.start_time, 0.1)  # Avoid division by zero
+        time_weighted_inventory = self.cumulative_abs_inventory_time / (self.inventory_max * elapsed_time) if self.inventory_max != float('inf') else 0.0
+        time_weighted_inventory = np.clip(time_weighted_inventory, 0.0, 1.0)
+
+        inventory_features = np.array([norm_inventory, time_weighted_inventory], dtype=np.float32)
 
         if self.drop_feature == 'drift':
             # dropping drift from base features
@@ -1231,6 +1301,8 @@ class RLAgent(ExecutionAgent):
             # dropping bid_price_drift, mid_price_drift from base features
             observation = np.concatenate([observation, market_order_imbalance, limit_order_imbalance, cancellation_imbalance, deltat_drift], dtype=np.float32)
 
+        # BILATERAL MM: Add inventory features to observation
+        observation = np.concatenate([observation, inventory_features], dtype=np.float32)
 
         return observation
     
