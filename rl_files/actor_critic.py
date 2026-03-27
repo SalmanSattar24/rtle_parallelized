@@ -613,10 +613,10 @@ if __name__ == "__main__":
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
-                # does args.vf_coef need to be tuned ? 
-                # could add entropy loss here 
+                # Compute entropy bonus (encourage exploration)
                 entropy_loss = entropy.mean()
-                loss = pg_loss  + v_loss * args.vf_coef
+                # Total loss: policy loss + value loss - entropy bonus (negative to maximize entropy)
+                loss = pg_loss + v_loss * args.vf_coef - entropy_loss * args.ent_coef
 
                 optimizer.zero_grad()
                 loss.backward()
