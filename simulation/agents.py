@@ -1268,8 +1268,8 @@ class RLAgent(ExecutionAgent):
             for order_id in agent_orders:
                 order = lob.order_map[order_id]
                 vol = max(0, round(order.volume))  # Ensure non-negative
-                if vol > 0 and volume_seen < self.volume:  # Don't exceed current volume
-                    vol_to_add = min(vol, self.volume - volume_seen)  # Cap at remaining
+                if vol > 0 and volume_seen < int(self.volume):  # Don't exceed current volume
+                    vol_to_add = min(vol, int(self.volume) - volume_seen)  # Cap at remaining
 
                     if order.side == 'ask':
                         level = order.price - best_ask
@@ -1290,31 +1290,31 @@ class RLAgent(ExecutionAgent):
         max_queue_size = 40
 
         # Fill remaining with inactive volume
-        while len(levels) < self.volume:
+        while len(levels) < int(self.volume):
             levels.append(self.observation_book_levels + 1)
             queues.append(0)
 
         # Add filled volume
         filled_volume = self.initial_volume - self.volume
-        for _ in range(filled_volume):
+        for _ in range(int(filled_volume)):
             levels.append(-self.observation_book_levels)
             queues.append(0)
 
         # Ensure exact size (clamp to required)
-        levels = levels[:self.initial_volume]
-        queues = queues[:self.initial_volume]
+        levels = levels[:int(self.initial_volume)]
+        queues = queues[:int(self.initial_volume)]
 
         # Pad if needed
-        while len(levels) < self.initial_volume:
+        while len(levels) < int(self.initial_volume):
             levels.append(-self.observation_book_levels)
             queues.append(0)
 
         # TEMPORARY: Relax assertions to allow debugging later
         # Just clamp to exact size if there's a mismatch
-        if len(queues) != self.initial_volume:
-            queues = queues[:self.initial_volume] + [0] * max(0, self.initial_volume - len(queues))
-        if len(levels) != self.initial_volume:
-            levels = levels[:self.initial_volume] + [-self.observation_book_levels] * max(0, self.initial_volume - len(levels))
+        if len(queues) != int(self.initial_volume):
+            queues = queues[:int(self.initial_volume)] + [0] * max(0, int(self.initial_volume) - len(queues))
+        if len(levels) != int(self.initial_volume):
+            levels = levels[:int(self.initial_volume)] + [-self.observation_book_levels] * max(0, int(self.initial_volume) - len(levels))
 
         # normalization 
         queues = np.array(queues, dtype=np.float32)/max_queue_size
