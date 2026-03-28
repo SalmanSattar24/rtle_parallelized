@@ -1273,6 +1273,7 @@ class RLAgent(ExecutionAgent):
                     level = order.price - best_ask
                     if 1 <= level <= self.observation_book_levels:
                         levels.extend([level] * int(order.volume))
+                        queues.extend([0] * int(order.volume))  # Add queue entries for within-range orders
                         volume_within_range += order.volume
                     else:
                         # Outside range, will be counted as volume_outside
@@ -1282,6 +1283,7 @@ class RLAgent(ExecutionAgent):
                     level = best_bid - order.price
                     if 1 <= level <= self.observation_book_levels:
                         levels.extend([-level] * int(order.volume))
+                        queues.extend([0] * int(order.volume))  # Add queue entries for within-range orders
                         volume_within_range += order.volume
                     else:
                         # Outside range
