@@ -994,14 +994,19 @@ class RLAgent(ExecutionAgent):
         assert self.start_time <= time <= self.terminal_time
         assert (time-self.start_time) % self.time_delta == 0, 'time must be divisible by time delta'
 
-        # BILATERAL MM: Handle both single action (one-sided) and dual actions (bilateral)
+        # BILATERAL MM: Handle both single action (one-sided), flattened (vectorized), and dual actions (bilateral)
         if isinstance(action, tuple) and len(action) == 2:
-            # Phase 2+: Bilateral mode (bid_action, ask_action)
+            # Phase 2+: Bilateral mode (bid_action, ask_action) via tuple
             bid_action, ask_action = action
+            return self._generate_bilateral_orders(lob, time, bid_action, ask_action)
+        elif len(action) == 14:
+            # Vectorized/Flattened Bilateral: [bid_0..6, ask_0..6]
+            bid_action = action[:7]
+            ask_action = action[7:]
             return self._generate_bilateral_orders(lob, time, bid_action, ask_action)
         else:
             # Current: One-sided mode (backward compatible)
-            assert len(action) == self.action_space_length, 'action length must be equal to action space length'
+            assert len(action) == self.action_space_length, f'action length {len(action)} must be equal to action space length {self.action_space_length}'
             return self._generate_unilateral_orders(lob, time, action)
 
     def _generate_unilateral_orders(self, lob, time, action):
