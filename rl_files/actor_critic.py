@@ -248,12 +248,17 @@ class AgentLogisticNormal(nn.Module):
         else:
             self.variance = None 
             self.log_std = nn.Parameter(torch.zeros(np.prod(envs.single_action_space.shape)-1), requires_grad=True)
-        # self.log_std = nn.Parameter(torch.zeros(np.prod(envs.single_action_space.shape)-1), requires_grad=True)
+ 
+        self.apply(layer_init)
 
-        # additional experiment no variance sclaing. but learning the std as a parameter
+    def check_parameters(self):
+        """Returns True if any parameters in the model are NaN."""
+        for name, param in self.named_parameters():
+            if torch.isnan(param).any():
+                return True, name
+        return False, None
 
-
-    def get_value(self, x):
+    def get_trunk_out(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None, deterministic=False):
@@ -422,8 +427,18 @@ class BilateralAgentLogisticNormal(nn.Module):
             self.variance = 1.0
         else:
             self.log_std = nn.Parameter(torch.zeros(action_dim), requires_grad=True)
+        
+        self.apply(layer_init)
+
+    def check_parameters(self):
+        """Returns True if any parameters in the model are NaN."""
+        for name, param in self.named_parameters():
+            if torch.isnan(param).any():
+                return True, name
+        return False, None
 
     def get_value(self, x):
+        x = torch.nan_to_num(x, nan=0.0, posinf=100.0, neginf=-100.0)
         trunk_out = self.trunk(x)
         return self.critic(trunk_out)
 
@@ -435,8 +450,12 @@ class BilateralAgentLogisticNormal(nn.Module):
             x: observation tensor (batch_size, obs_dim)
             action: Tuple of (bid_action, ask_action) for computing log probs [optional]
             deterministic: If True, use means without sampling
-
-        Returns:
+        """
+        # Phase G Sanitization: Ensure input is never NaN/Inf
+        x = torch.nan_to_num(x, nan=0.0, posinf=100.0, neginf=-100.0)
+        
+        trunk_out = self.trunk(x)
+        """
             actions: Tuple (bid_action, ask_action), each shape (batch_size, K+1)
             log_prob: Sum of bid and ask log probs, shape (batch_size,)
             entropy: Sum of bid and ask entropies, shape (batch_size,)
@@ -460,6 +479,10 @@ class BilateralAgentLogisticNormal(nn.Module):
         # Stability: Ensure scale is strictly positive and non-zero
         bid_std = torch.clamp(bid_std, min=1e-4)
         ask_std = torch.clamp(ask_std, min=1e-4)
+        
+        # Phase G Sanitization: Ensure means are never NaN/Inf before distribution creation
+        bid_mean = torch.nan_to_num(bid_mean, nan=0.0)
+        ask_mean = torch.nan_to_num(ask_mean, nan=0.0)
         
         bid_dist = Normal(bid_mean, bid_std)
         ask_dist = Normal(ask_mean, ask_std)
