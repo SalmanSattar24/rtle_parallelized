@@ -258,7 +258,7 @@ class Market(gym.Env):
                 transition_reward -= q_penalty
 
                 # 2. SOTA: Hard Circuit Breaker (Termination + Shock Penalty)
-                if abs(self.agent_inventory) >= self.inventory_max:
+                if abs(self.agent_inventory) > self.inventory_max:
                     transition_reward = -400.0  # Severe catastrophic reward to force policy avoidance
                     terminated = True
                     self.circuit_breaker_triggered = True

@@ -1386,9 +1386,7 @@ class RLAgent(ExecutionAgent):
         self.last_bid_vol, self.last_ask_vol = curr_bid_v, curr_ask_v
 
         # SOTA: Inventory Features
-        norm_inventory = net_inventory / 30.0 # Normalize by I_max
-        # SOTA: Inventory Features
-        norm_inventory = net_inventory / 30.0 # Normalize by I_max
+        norm_inventory = net_inventory / (self.inventory_max + 1e-8)
         inventory_features = np.array([norm_inventory, time_weighted_inventory, ofi], dtype=np.float32)
 
         if self.drop_feature == 'drift':
