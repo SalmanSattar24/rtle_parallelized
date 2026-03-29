@@ -300,7 +300,7 @@ class Market(gym.Env):
         if self.execution_agent_id == 'rl_agent':
             # if rl agent is present, get an observation from the market 
             # this observation then feeds into the neural network 
-            observation = self.agents[self.execution_agent_id].get_observation(t, self.lob)
+            observation = self.agents[self.execution_agent_id].get_observation(t, self.lob, self.agent_inventory, self.time_weighted_inventory / (t + 1e-8))
         else:
             # benchmark agents return no observation 
             observation = np.array([None], dtype=np.float32)            

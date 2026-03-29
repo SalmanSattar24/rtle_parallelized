@@ -1195,7 +1195,7 @@ class RLAgent(ExecutionAgent):
         else:
             return None
 
-    def get_observation(self, time, lob):        
+    def get_observation(self, time, lob, net_inventory=0, time_weighted_inventory=0):        
         """
             - sets reference prices if time == self.start_time
             - computes observations 
@@ -1385,6 +1385,10 @@ class RLAgent(ExecutionAgent):
         self.last_bid_price, self.last_ask_price = curr_bid_p, curr_ask_p
         self.last_bid_vol, self.last_ask_vol = curr_bid_v, curr_ask_v
 
+        # SOTA: Inventory Features
+        norm_inventory = net_inventory / 30.0 # Normalize by I_max
+        # SOTA: Inventory Features
+        norm_inventory = net_inventory / 30.0 # Normalize by I_max
         inventory_features = np.array([norm_inventory, time_weighted_inventory, ofi], dtype=np.float32)
 
         if self.drop_feature == 'drift':
