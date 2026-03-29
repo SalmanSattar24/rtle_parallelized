@@ -249,17 +249,13 @@ class Market(gym.Env):
                 reward, terminated = self.agents[self.execution_agent_id].update_position_from_message_list(msgs)
                 transition_reward += reward
 
-                # BILATERAL MM: Update net inventory and apply SOTA controls
+                # BILATERAL MM: Update net inventory
                 self.agent_inventory = self.lob.agent_net_inventory.get(self.execution_agent_id, 0)
-                
-                # 1. SOTA: Quadratic Inventory Penalty (Running)
-                # Encourage small positions, punish large ones disproportionately
-                q_penalty = self.penalty_weight * (self.agent_inventory ** 2)
-                transition_reward -= q_penalty
 
-                # 2. SOTA: Hard Circuit Breaker (Termination + Shock Penalty)
+                # Circuit Breaker: terminate episode if inventory exceeds cap
+                # Paper-faithful: no artificial penalty, just end the episode.
+                # The quota system (Q_max) should prevent this from happening.
                 if abs(self.agent_inventory) > self.inventory_max:
-                    transition_reward = -400.0  # Severe catastrophic reward to force policy avoidance
                     terminated = True
                     self.circuit_breaker_triggered = True
                     break
