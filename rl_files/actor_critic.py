@@ -254,6 +254,22 @@ class AgentLogisticNormal(nn.Module):
  
         self.apply(layer_init)
 
+    def set_variance(self, variance: float):
+        """Set scalar exploration variance for variance-scaled logistic-normal policy."""
+        if not self.variance_scaling:
+            raise RuntimeError("set_variance is only available when variance_scaling=True")
+        v = float(variance)
+        if not np.isfinite(v):
+            raise ValueError(f"variance must be finite, got {variance}")
+        # Keep scale strictly positive for Normal distribution stability.
+        self.variance = max(v, 1e-4)
+
+    def get_variance(self) -> float:
+        """Return current scalar variance used for exploration (if enabled)."""
+        if not self.variance_scaling:
+            raise RuntimeError("get_variance is only available when variance_scaling=True")
+        return float(self.variance)
+
     def check_parameters(self):
         """Returns True if any parameters in the model are NaN."""
         for name, param in self.named_parameters():
@@ -432,6 +448,22 @@ class BilateralAgentLogisticNormal(nn.Module):
             self.log_std = nn.Parameter(torch.zeros(action_dim), requires_grad=True)
         
         self.apply(layer_init)
+
+    def set_variance(self, variance: float):
+        """Set shared scalar exploration variance for bid/ask logistic-normal policies."""
+        if not self.variance_scaling:
+            raise RuntimeError("set_variance is only available when variance_scaling=True")
+        v = float(variance)
+        if not np.isfinite(v):
+            raise ValueError(f"variance must be finite, got {variance}")
+        # Keep scale strictly positive for Normal distribution stability.
+        self.variance = max(v, 1e-4)
+
+    def get_variance(self) -> float:
+        """Return current shared scalar variance used for exploration."""
+        if not self.variance_scaling:
+            raise RuntimeError("get_variance is only available when variance_scaling=True")
+        return float(self.variance)
 
     def check_parameters(self):
         """Returns True if any parameters in the model are NaN."""
