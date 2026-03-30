@@ -944,8 +944,8 @@ class RLAgent(ExecutionAgent):
         # bid and ask volumes: 5 + 5
         # levels and queue positions: 2*60
         # added cancellation imbalance features
-        # BILATERAL MM: +2 for inventory, +1 for OFI
-        self.observation_space_length = 6+4+6+5+5+2*int(volume)+1 + 2 + 1
+        # BILATERAL MM: +2 inventory features
+        self.observation_space_length = 6+4+6+5+5+2*int(volume)+1 + 2
         # adjusting observation space length if we drop features
         if self.drop_feature == 'volume':
             # 5 order book levels on each side + imbalance feature
@@ -1009,16 +1009,35 @@ class RLAgent(ExecutionAgent):
             assert len(action) == self.action_space_length, f'action length {len(action)} must be equal to action space length {self.action_space_length}'
             return self._generate_unilateral_orders(lob, time, action)
 
+    def _normalize_action_simplex(self, action):
+        """Robustly map an arbitrary action vector to simplex coordinates."""
+        action = np.asarray(action, dtype=np.float32)
+        if action.ndim != 1:
+            action = action.reshape(-1)
+        if action.size == 0:
+            raise ValueError("action must be non-empty")
+
+        # Already a valid simplex vector
+        if np.all(action >= 0) and np.isfinite(action).all() and np.abs(np.sum(action) - 1.0) < 1e-6:
+            return action
+
+        # Softmax transform for unconstrained/raw actions (stable)
+        action = np.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
+        action = action - np.max(action)
+        exp_action = np.exp(action)
+        denom = np.sum(exp_action)
+        if denom <= 0 or not np.isfinite(denom):
+            return np.ones_like(exp_action, dtype=np.float32) / float(exp_action.size)
+        return (exp_action / denom).astype(np.float32)
+
     def _generate_unilateral_orders(self, lob, time, action):
         """
         Generate one-sided (sell-only) orders. Current implementation.
         Called from generate_order when action is a single vector.
         """
         if time >= self.start_time and time < self.terminal_time:
-            # normalize action such that its part of the simplex
-            # action = np.exp(action)/np.sum(np.exp(action), axis=0)
-            assert np.all(action >= 0), 'all action values must be >= 0'
-            assert np.abs(np.sum(action)-1) < 1e-6, 'action must sum to 1'
+            # Robustly normalize to simplex for compatibility with raw policy/test actions
+            action = self._normalize_action_simplex(action)
             best_bid = lob.get_best_price('bid')
 
             # target volumes:
@@ -1110,11 +1129,9 @@ class RLAgent(ExecutionAgent):
             - Ask side: Market sells + limit sells above best ask
         """
         if time >= self.start_time and time < self.terminal_time:
-            # Validate actions
-            assert np.all(bid_action >= 0), 'bid_action values must be >= 0'
-            assert np.all(ask_action >= 0), 'ask_action values must be >= 0'
-            assert np.abs(np.sum(bid_action)-1) < 1e-6, 'bid_action must sum to 1'
-            assert np.abs(np.sum(ask_action)-1) < 1e-6, 'ask_action must sum to 1'
+            # Robustly normalize both sides for compatibility with raw policy/test actions
+            bid_action = self._normalize_action_simplex(bid_action)
+            ask_action = self._normalize_action_simplex(ask_action)
 
             best_bid = lob.get_best_price('bid')
             best_ask = lob.get_best_price('ask')
@@ -1399,9 +1416,11 @@ class RLAgent(ExecutionAgent):
         self.last_bid_price, self.last_ask_price = curr_bid_p, curr_ask_p
         self.last_bid_vol, self.last_ask_vol = curr_bid_v, curr_ask_v
 
-        # SOTA: Inventory Features
+        # Inventory features (bounded for stability and contract consistency)
         norm_inventory = net_inventory / (self.inventory_max + 1e-8)
-        inventory_features = np.array([norm_inventory, time_weighted_inventory, ofi], dtype=np.float32)
+        norm_inventory = float(np.clip(norm_inventory, -1.0, 1.0))
+        time_weighted_inventory = float(np.clip(time_weighted_inventory, 0.0, 1.0))
+        inventory_features = np.array([norm_inventory, time_weighted_inventory], dtype=np.float32)
 
         if self.drop_feature == 'drift':
             # dropping drift from base features

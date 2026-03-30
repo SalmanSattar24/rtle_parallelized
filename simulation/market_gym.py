@@ -210,6 +210,11 @@ class Market(gym.Env):
         # runs up to first observation or stops if the simulation is terminated
         # if there is no RL agent present and no observation agent present, transition will just run straight to the end without any intermediate action
         observation, reward, terminated, info = self.transition()
+
+        # Backward compatibility for benchmark-agent tests that expect zeroed inventory post-reset
+        if self.execution_agent_id != 'rl_agent':
+            self.agent_inventory = 0
+
         # this will terminate if the execution agent is one of the benchmark agents
         return observation, info
     

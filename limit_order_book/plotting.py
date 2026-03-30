@@ -14,7 +14,7 @@ import pandas as pd
 # TODO: Wrap all the data into one data frame 
 
 
-def heat_map(trades, level2, event_times, max_level=30, scale=1000, max_volume=1000, xlim=[0,150], ylim=[995,1005], width=6.75, height=9):
+def heat_map(trades, level2, event_times=None, max_level=30, scale=1000, max_volume=1000, xlim=[0,150], ylim=[995,1005], width=6.75, height=9):
     '''
     inputs:
         - trades: data frame with columns ['type', 'side', 'size', 'price']
@@ -34,6 +34,11 @@ def heat_map(trades, level2, event_times, max_level=30, scale=1000, max_volume=1
     ask_volumes = np.hstack(np.array(level2[ask_volumes]))
 
     # comment this line to use use tick time: 1,2,3, and so on 
+    if event_times is None:
+        if 'time' in level2.columns:
+            event_times = level2['time'].values
+        else:
+            event_times = np.arange(len(level2))
     trades.time = event_times
     time = np.array(event_times)
     N = len(time)
@@ -85,16 +90,18 @@ def heat_map(trades, level2, event_times, max_level=30, scale=1000, max_volume=1
 
     # lg = plt.legend(['best ask price', 'best bid price', 'market buy', 'market sell'], prop={'size': 12}, loc='upper left')
     lg = plt.legend(prop={'size': 16}, loc='upper left')
-    # print(lg.legendHandles[2]._sizes)
-    # print(lg.legendHandles[0]._sizes)
-    lg.legendHandles[2]._sizes = [150]
-    lg.legendHandles[1]._sizes = [150]
-    # lg.legendHandles[3]._sizes = [150]
-    
+    # Matplotlib compatibility: older versions expose legendHandles, newer expose legend_handles
+    handles = getattr(lg, 'legendHandles', None)
+    if handles is None:
+        handles = getattr(lg, 'legend_handles', [])
+    if len(handles) > 2 and hasattr(handles[2], '_sizes'):
+        handles[2]._sizes = [150]
+    if len(handles) > 1 and hasattr(handles[1], '_sizes'):
+        handles[1]._sizes = [150]
 
     return None  
 
-def plot_average_book_shape(bid_volumes, ask_volumes, ax, level=3, symetric=False, file_name='shape', title='average shape'):
+def plot_average_book_shape(bid_volumes, ask_volumes, ax=None, level=3, symetric=False, file_name='shape', title='average shape'):
     """
     - bid/ask_volumes: list of np arrays, [v1, v2, v3, ...]
     """ 
@@ -108,7 +115,9 @@ def plot_average_book_shape(bid_volumes, ask_volumes, ax, level=3, symetric=Fals
     book_shape_ask = np.nanmean(ask_volumes, axis=0)[:level]
 
 
-    # plt.figure(figsize=(10, 6))     
+    # plt.figure(figsize=(10, 6))
+    if ax is None:
+        _, ax = plt.subplots(figsize=(10, 6))
     ax.grid(zorder=0)
     if symetric:
         shape = (book_shape_bid + book_shape_ask)/2

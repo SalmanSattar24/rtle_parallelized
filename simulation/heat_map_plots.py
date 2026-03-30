@@ -23,7 +23,7 @@ observation, info = M.reset()
 print(info)
 
 
-level2, orders, market_orders = M.lob.log_to_df()
+level2, orders, market_orders = M.lob.log_to_df(include_market_orders=True)
 textwidth = 16
 textheight = 9
 scale=0.75
